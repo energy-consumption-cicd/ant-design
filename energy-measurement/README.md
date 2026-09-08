@@ -43,7 +43,7 @@ and no others:
 
 | # | difference | why |
 |---|---|---|
-| D-1 | `ubuntu:24.04` by digest under `docker run`, user `runner` (uid 1001), workspace at `/workspace` | dedicated bench |
+| D-1 | `ubuntu:24.04` by digest under `docker run`, user `runner` (uid 1000), workspace at `/workspace` | dedicated bench |
 | D-2 | one `--rm` container per stage | measurement construct; it also keeps the two dependency trees apart |
 | D-3 | `ut` (`test.yml:172`) runs at image build; `node_modules` and the utoo store are frozen in the image, including the Chrome for Testing and libvips downloads of `.npmrc:3-4` | the stages run with `--network none`, and the hosted runner resolves against a warm registry with a CDN |
 | D-4 | `utoo` pinned to 1.1.8 and Node to 22.23.2, sha256-verified | `utooland/setup-utoo` asks for `latest`, and the build and test jobs inherit Node from the runner image; neither version would otherwise be recorded |
