@@ -30,9 +30,9 @@ RUN set -eux; \
 
 RUN npm install -g "utoo@${UTOO_VERSION}" && ut --version
 
-# uid 1001 is the hosted runner's own uid, and uid 1000 is already taken in the
-# base image.
-RUN useradd -m -u 1001 runner
+# uid 1000 matches the bench user, so the timing volume run_pipeline.sh mounts is
+# writable from inside the container; the base image already holds that uid.
+RUN userdel -r ubuntu && useradd -m -u 1000 runner
 
 # The hosted runner owns its Node prefix. Without this, node-gyp cannot be
 # installed globally and @parcel/watcher silently skips its build script, a
