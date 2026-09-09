@@ -20,12 +20,12 @@ BASELINE_GATE_MAX_PKG_W=1.0
 BASELINE_GATE_EXIT=90
 ENERGY_BASELINE_GATE="${ENERGY_BASELINE_GATE:-on}"
 # Stage ceiling: a hung harness costs one run, not the job's 20 h. Exit 91 sits
-# outside every declared workload exit code, like 90. The defaults below are
-# provisional upper bounds carried over until the ceiling amendment fixes this
-# project's values from the wall observed on the bench. Non-default values are
-# for declared diagnostic sessions only and are recorded in the sidecar.
-STAGE_TIMEOUT_BUILD_DEFAULT=1000
-STAGE_TIMEOUT_TEST_DEFAULT=3600
+# outside every declared workload exit code, like 90. Values fixed by EMENDA-3
+# at 1.5x the largest wall observed on the bench (158.96 s and 2274.36 s over
+# five runs); the real cost is the ceiling plus the 30 s of -k. Non-default
+# values are for declared diagnostic sessions only and are recorded in the sidecar.
+STAGE_TIMEOUT_BUILD_DEFAULT=240
+STAGE_TIMEOUT_TEST_DEFAULT=3400
 ENERGY_STAGE_TIMEOUT_BUILD_S="${ENERGY_STAGE_TIMEOUT_BUILD_S:-$STAGE_TIMEOUT_BUILD_DEFAULT}"
 ENERGY_STAGE_TIMEOUT_TEST_S="${ENERGY_STAGE_TIMEOUT_TEST_S:-$STAGE_TIMEOUT_TEST_DEFAULT}"
 STAGE_TIMEOUT_EXIT=91
