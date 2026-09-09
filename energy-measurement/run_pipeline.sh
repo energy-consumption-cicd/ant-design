@@ -19,10 +19,21 @@ BASELINE_DURATION=120
 BASELINE_GATE_MAX_PKG_W=1.0
 BASELINE_GATE_EXIT=90
 ENERGY_BASELINE_GATE="${ENERGY_BASELINE_GATE:-on}"
+# Stage ceiling: a hung harness costs one run, not the job's 20 h. Exit 91 sits
+# outside every declared workload exit code, like 90. The defaults below are
+# provisional upper bounds carried over until the ceiling amendment fixes this
+# project's values from the wall observed on the bench. Non-default values are
+# for declared diagnostic sessions only and are recorded in the sidecar.
+STAGE_TIMEOUT_BUILD_DEFAULT=1000
+STAGE_TIMEOUT_TEST_DEFAULT=3600
+ENERGY_STAGE_TIMEOUT_BUILD_S="${ENERGY_STAGE_TIMEOUT_BUILD_S:-$STAGE_TIMEOUT_BUILD_DEFAULT}"
+ENERGY_STAGE_TIMEOUT_TEST_S="${ENERGY_STAGE_TIMEOUT_TEST_S:-$STAGE_TIMEOUT_TEST_DEFAULT}"
+STAGE_TIMEOUT_EXIT=91
 TIME_FILE="/tmp/ant_design_time_$$.txt"
 CSV_FILE="$RESULTS_DIR/run_$(printf '%02d' "$RUN_NUM").csv"
 EXITS_FILE="$RESULTS_DIR/exit_codes_run_$(printf '%02d' "$RUN_NUM").txt"
 BASELINE_DISCARD_FILE="$RESULTS_DIR/discarded_baseline_run_$(printf '%02d' "$RUN_NUM").txt"
+TIMEOUT_DISCARD_FILE="$RESULTS_DIR/discarded_timeout_run_$(printf '%02d' "$RUN_NUM").txt"
 
 # No swap inside the container: the limit is the bench's usable RAM.
 MEM_LIMIT="${MEM_LIMIT:-12g}"
@@ -30,6 +41,15 @@ MEM_SWAP="${MEM_SWAP:-$MEM_LIMIT}"
 
 PIPELINE_EXIT=0
 FAILED_STAGES=""
+
+# A signal to the docker client does not stop the container; kill it by name.
+CURRENT_CONTAINER=""
+cleanup_container() {
+  if [ -n "$CURRENT_CONTAINER" ]; then
+    docker kill "$CURRENT_CONTAINER" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup_container EXIT INT TERM
 
 mkdir -p "$RESULTS_DIR" "$LOGS_DIR"
 
@@ -180,12 +200,51 @@ fi
 if [ "$ENERGY_BASELINE_GATE" = "off" ]; then
   echo "::warning title=Baseline gate disabled::ENERGY_BASELINE_GATE=off for run $RUN_NUM (diagnostic session; must be declared)"
 fi
+if [ "$ENERGY_STAGE_TIMEOUT_BUILD_S" != "$STAGE_TIMEOUT_BUILD_DEFAULT" ] || \
+   [ "$ENERGY_STAGE_TIMEOUT_TEST_S" != "$STAGE_TIMEOUT_TEST_DEFAULT" ]; then
+  echo "::warning title=Stage ceiling changed::build ${ENERGY_STAGE_TIMEOUT_BUILD_S}s, test ${ENERGY_STAGE_TIMEOUT_TEST_S}s for run $RUN_NUM (pre-registered ${STAGE_TIMEOUT_BUILD_DEFAULT}s/${STAGE_TIMEOUT_TEST_DEFAULT}s; diagnostic session; must be declared)"
+fi
 
 echo "run,stage,energy_pkg_j,energy_cores_j,energy_gpu_j,energy_ram_j,wall_time_s,user_time_s,sys_time_s,energy_ram_liquid_raw_j,wall_time_container_s,baseline_rate_pkg_w,baseline_rate_cores_w,baseline_rate_ram_w" \
   > "$CSV_FILE"
 
 total_pkg=0; total_cores=0; total_gpu=0; total_ram=0; total_ram_raw=0
 total_wall=0; total_user=0; total_sys=0; total_wall_container=0
+
+# Ceiling reached: no measurement exists, so no CSV row; the sidecar records the
+# ceiling applied and the last known progress marker, and the run exits 91.
+abort_stage_timeout() {
+  local stage="$1" ceiling="$2" texit="$3" cname="$4" start_utc="$5" stage_log="$6" wall="$7"
+  local abort_utc kill_result marker last_line last_utc
+  abort_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  if docker kill "$cname" >/dev/null 2>&1; then kill_result="ok"; else kill_result="no-such-container"; fi
+  docker rm -f "$cname" >/dev/null 2>&1 || true
+  CURRENT_CONTAINER=""
+  # Every lookup below may legitimately find nothing; none may trip errexit.
+  marker=$(grep -E '^=== .*: start ' "$stage_log" 2>/dev/null | tail -n 1 || true)
+  last_line=$(tail -n 1 "$stage_log" 2>/dev/null | sed 's/\x1b\[[0-9;]*[A-Za-z]//g' | cut -c1-200 || true)
+  last_utc=$(date -u -r "$stage_log" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "-")
+  {
+    echo "run,$RUN_NUM"
+    echo "stage,$stage"
+    echo "timeout_s,$ceiling"
+    echo "timeout_exit,$texit"
+    echo "start_utc,$start_utc"
+    echo "abort_utc,$abort_utc"
+    echo "wall_observed_s,$wall"
+    echo "container,$cname"
+    echo "docker_kill,$kill_result"
+    echo "stage_log,logs/$(basename "$stage_log")"
+    echo "last_step_marker,${marker:--}"
+    echo "last_log_line_utc,$last_utc"
+    echo "last_log_line,${last_line:--}"
+    echo "csv_row_written,no"
+  } > "$TIMEOUT_DISCARD_FILE"
+  echo "$RUN_NUM,$stage,$STAGE_TIMEOUT_EXIT" >> "$EXITS_FILE"
+  rm -f "$CSV_FILE" "$TIME_FILE"
+  echo "::error title=Stage ceiling::run $RUN_NUM, stage '$stage': ${wall}s exceeded the ${ceiling}s ceiling (timeout exit $texit); container $cname killed ($kill_result). No CSV; see $TIMEOUT_DISCARD_FILE"
+  exit "$STAGE_TIMEOUT_EXIT"
+}
 
 measure_stage() {
   local stage="$1"
@@ -203,13 +262,24 @@ measure_stage() {
 
   local stage_log="$LOGS_DIR/run_$(printf '%02d' "$RUN_NUM")_${stage}.log"
   local stage_exit=0
+  local stage_timeout cname stage_start_utc
+  case "$stage" in
+    build) stage_timeout="$ENERGY_STAGE_TIMEOUT_BUILD_S" ;;
+    *)     stage_timeout="$ENERGY_STAGE_TIMEOUT_TEST_S" ;;
+  esac
+  cname="ant-design-run$(printf '%02d' "$RUN_NUM")-${stage}"
+  # A residual container of the same name is exactly the case the ceiling exists for.
+  docker rm -f "$cname" >/dev/null 2>&1 || true
+  CURRENT_CONTAINER="$cname"
+  stage_start_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   set +e
   # --network none: all inputs are pre-baked into the image; measured energy
   # must not include network traffic (construct definition).
   # fd3 preserves the workload stderr while `time` captures wall/user/sys inside
   # the container, so child CPU time is attributed to the stage.
   /usr/bin/time -f "%e" -o "$TIME_FILE" \
-    docker run --rm --privileged --network none \
+    timeout --foreground -s TERM -k 30 "$stage_timeout" \
+    docker run --rm --name "$cname" --privileged --network none \
       --memory="$MEM_LIMIT" --memory-swap="$MEM_SWAP" \
       -v "$MEDICAO_DIR:/medicao:ro" \
       -v "$timing_dir:/timing" \
@@ -220,6 +290,17 @@ measure_stage() {
   stage_exit=${PIPESTATUS[0]}
   set -e
   echo "  stage log: $stage_log"
+
+  local wall_now
+  wall_now=$(tail -n 1 "$TIME_FILE" 2>/dev/null || echo 0)
+  [[ "$wall_now" =~ ^[0-9]+(\.[0-9]+)?$ ]] || wall_now=0
+  # 124: timeout sent TERM. 137 is also the workload's own SIGKILL exit, so it
+  # only counts as the ceiling when the wall actually reached it.
+  if [ "$stage_exit" -eq 124 ] || { [ "$stage_exit" -eq 137 ] && awk "BEGIN {exit !($wall_now >= $stage_timeout)}"; }; then
+    rm -rf "$timing_dir"
+    abort_stage_timeout "$stage" "$stage_timeout" "$stage_exit" "$cname" "$stage_start_utc" "$stage_log" "$wall_now"
+  fi
+  CURRENT_CONTAINER=""
 
   # The exit code is the only rejection criterion; the measurement is kept
   # either way.
